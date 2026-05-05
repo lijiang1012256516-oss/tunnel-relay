@@ -196,8 +196,41 @@ class RelayServer:
         return pair
 
     async def _relay(self, src_ws, dst_ws, direction: str):
+        """Relay messages between paired clients, with keepalive"""
+        async def _keepalive():
+            """Send periodic pings to keep Render connection alive"""
+            try:
+                while True:
+                    await asyncio.sleep(20)
+                    try:
+                        await src_ws.ping()
+                    except:
+                        break
+                    try:
+                        await dst_ws.ping()
+                    except:
+                        break
+            except asyncio.CancelledError:
+                pass
+
+        keepalive_task = asyncio.create_task(_keepalive())
         try:
             async for raw in src_ws:
+                # Skip application-level heartbeat messages
+                try:
+                    msg = json.loads(raw)
+                    if msg.get("type") == "ping":
+                        # Forward as pong to destination
+                        try:
+                            await dst_ws.send(json.dumps({"type": "pong", "ts": msg.get("ts", 0)}))
+                        except:
+                            break
+                        continue
+                    if msg.get("type") == "pong":
+                        continue  # Skip pong, already handled
+                except (json.JSONDecodeError, TypeError):
+                    pass  # Not JSON, forward as-is
+
                 try:
                     await dst_ws.send(raw)
                 except Exception as e:
@@ -208,6 +241,7 @@ class RelayServer:
         except Exception as e:
             log.error(f"Relay exception ({direction}): {e}")
         finally:
+            keepalive_task.cancel()
             try: await dst_ws.close(4003, "Peer disconnected")
             except: pass
             async with self.lock:
