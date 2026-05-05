@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 WebSocket Tunnel Relay Server - Render.com
+Compatible with websockets 13.x and 16.x
 No pairing timeout - clients can connect at any time
 """
 
@@ -15,10 +16,6 @@ from typing import Optional
 
 try:
     import websockets
-    try:
-        from websockets.server import serve
-    except ImportError:
-        from websockets.legacy.server import serve
 except ImportError:
     print("pip install websockets")
     exit(1)
@@ -31,14 +28,6 @@ logging.basicConfig(
 log = logging.getLogger("relay")
 
 MSG_AUTH = "auth"
-MSG_CONNECT = "connect"
-MSG_CONNECT_OK = "connect_ok"
-MSG_CONNECT_FAIL = "connect_fail"
-MSG_DATA = "data"
-MSG_CLOSE = "close"
-MSG_PING = "ping"
-MSG_PONG = "pong"
-
 AUTH_TIMEOUT = 10
 TIMESTAMP_TOLERANCE = 60
 HEARTBEAT_INTERVAL = 30
@@ -56,7 +45,6 @@ class TunnelPair:
         self.pair_id = pair_id
         self.client_ws = None
         self.server_ws = None
-        self.created_at = time.time()
 
     @property
     def is_complete(self) -> bool:
@@ -69,23 +57,24 @@ class RelayServer:
         self.lock = asyncio.Lock()
 
     async def handle_connection(self, websocket):
-        remote_addr = websocket.remote_address
-        log.info(f"New connection from {remote_addr}")
+        """Handle new WebSocket connection - works with both ws 13.x and 16.x"""
+        log.info(f"New connection")
 
         role, pair_id = await self._authenticate(websocket)
         if role is None:
-            log.warning(f"Auth failed: {remote_addr}")
+            log.warning("Auth failed")
             await websocket.close(4001, "Auth failed")
             return
 
-        log.info(f"Auth OK: {role} pair={pair_id} @ {remote_addr}")
+        log.info(f"Auth OK: {role} pair={pair_id}")
 
         pair = await self._join_pair(websocket, role, pair_id)
         if pair is None:
             return
 
+        # Wait for pairing (no timeout)
         if not pair.is_complete:
-            log.info(f"{role} waiting for pair (pair={pair_id})...")
+            log.info(f"{role} waiting for pair...")
             try:
                 await websocket.send(json.dumps({"type": "status", "msg": "waiting"}))
                 counter = 0
@@ -144,17 +133,13 @@ class RelayServer:
             pair = self.pairs[pair_id]
             if role == "client":
                 if pair.client_ws is not None:
-                    try:
-                        await pair.client_ws.close(4002, "Replaced")
-                    except:
-                        pass
+                    try: await pair.client_ws.close(4002, "Replaced")
+                    except: pass
                 pair.client_ws = websocket
             else:
                 if pair.server_ws is not None:
-                    try:
-                        await pair.server_ws.close(4002, "Replaced")
-                    except:
-                        pass
+                    try: await pair.server_ws.close(4002, "Replaced")
+                    except: pass
                 pair.server_ws = websocket
         return pair
 
@@ -167,25 +152,18 @@ class RelayServer:
                     log.error(f"Relay error ({direction}): {e}")
                     break
         except websockets.ConnectionClosed as e:
-            log.info(f"Connection closed ({direction}): code={e.code}")
+            log.info(f"Closed ({direction}): code={e.code}")
         except Exception as e:
             log.error(f"Relay exception ({direction}): {e}")
         finally:
-            try:
-                await dst_ws.close(4003, "Peer disconnected")
-            except:
-                pass
+            try: await dst_ws.close(4003, "Peer disconnected")
+            except: pass
             async with self.lock:
                 for pid, pair in list(self.pairs.items()):
                     if pair.client_ws is src_ws or pair.server_ws is src_ws:
                         self.pairs.pop(pid, None)
                         log.info(f"Pair cleaned: {pid}")
                         break
-
-async def health_handler(path, request_headers):
-    if path == "/health":
-        return (200, [], b"OK")
-    return None
 
 async def main():
     port = int(os.environ.get("PORT", "8765"))
@@ -197,10 +175,12 @@ async def main():
     if not args.secret:
         print("Error: SECRET env var or --secret required")
         exit(1)
+
     server = RelayServer(secret=args.secret)
     log.info(f"Relay server starting: 0.0.0.0:{args.port}")
-    log.info(f"Secret: {args.secret[:4]}{'*' * (len(args.secret) - 4)}")
-    async with serve(
+
+    # websockets 16.x compatible - no process_request (handle health check in handler)
+    async with websockets.serve(
         server.handle_connection,
         "0.0.0.0",
         args.port,
@@ -208,7 +188,6 @@ async def main():
         ping_timeout=10,
         close_timeout=5,
         max_size=2**20,
-        process_request=health_handler,
     ):
         log.info("Server ready, waiting for connections...")
         await asyncio.Future()
