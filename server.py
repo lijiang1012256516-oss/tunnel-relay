@@ -96,19 +96,22 @@ class RelayServer:
         if pair is None:
             return
 
-        # Wait for pairing (no timeout)
+        # Wait for pairing (no timeout, with keepalive)
         if not pair.is_complete:
             log.info(f"{role} waiting for pair...")
             try:
                 await websocket.send(json.dumps({"type": "status", "msg": "waiting"}))
                 counter = 0
                 while not pair.is_complete:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(5)
                     counter += 1
-                    if counter % 15 == 0:
+                    # Send keepalive every 20s (counter increments every 5s)
+                    if counter % 4 == 0:
                         try:
                             await websocket.send(json.dumps({"type": "status", "msg": "waiting"}))
+                            log.info(f"Keepalive sent to {role} (pair={pair_id})")
                         except:
+                            log.warning(f"Keepalive failed for {role}, connection lost")
                             return
             except Exception as e:
                 log.error(f"Wait exception: {e}")
