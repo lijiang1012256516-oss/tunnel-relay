@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 WebSocket Tunnel Relay Server - Render.com
-Compatible with websockets 13.x and 16.x
+Compatible with websockets 12.x, 13.x, 14.x, 15.x, 16.x
 No pairing timeout - clients can connect at any time
 """
 
@@ -11,7 +11,9 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import time
+import traceback
 from typing import Optional
 
 try:
@@ -19,6 +21,11 @@ try:
 except ImportError:
     print("pip install websockets")
     exit(1)
+
+# Log websockets version for debugging
+ws_version = getattr(websockets, '__version__', 'unknown')
+print(f"[STARTUP] websockets version: {ws_version}")
+print(f"[STARTUP] Python version: {sys.version}")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,18 +64,35 @@ class RelayServer:
         self.lock = asyncio.Lock()
 
     async def handle_connection(self, websocket):
-        """Handle new WebSocket connection - works with both ws 13.x and 16.x"""
-        log.info(f"New connection")
+        """Handle new WebSocket connection - works with all websockets versions"""
+        log.info(f"New connection from {getattr(websocket, 'remote_address', 'unknown')}")
 
-        role, pair_id = await self._authenticate(websocket)
+        try:
+            role, pair_id = await self._authenticate(websocket)
+        except Exception as e:
+            log.error(f"Auth exception: {e}\n{traceback.format_exc()}")
+            try:
+                await websocket.close(4001, "Auth error")
+            except:
+                pass
+            return
+
         if role is None:
             log.warning("Auth failed")
-            await websocket.close(4001, "Auth failed")
+            try:
+                await websocket.close(4001, "Auth failed")
+            except:
+                pass
             return
 
         log.info(f"Auth OK: {role} pair={pair_id}")
 
-        pair = await self._join_pair(websocket, role, pair_id)
+        try:
+            pair = await self._join_pair(websocket, role, pair_id)
+        except Exception as e:
+            log.error(f"Join pair exception: {e}\n{traceback.format_exc()}")
+            return
+
         if pair is None:
             return
 
@@ -86,7 +110,8 @@ class RelayServer:
                             await websocket.send(json.dumps({"type": "status", "msg": "waiting"}))
                         except:
                             return
-            except:
+            except Exception as e:
+                log.error(f"Wait exception: {e}")
                 return
 
         if not pair.is_complete:
@@ -108,22 +133,49 @@ class RelayServer:
     async def _authenticate(self, websocket) -> tuple:
         try:
             raw = await asyncio.wait_for(websocket.recv(), timeout=AUTH_TIMEOUT)
-        except:
+        except asyncio.TimeoutError:
+            log.warning("Auth timeout - no message received")
             return None, None
+        except Exception as e:
+            log.warning(f"Auth recv error: {e}")
+            return None, None
+
+        log.info(f"Auth received: {raw[:200]}")
+
         try:
             msg = json.loads(raw)
-        except:
+        except json.JSONDecodeError:
+            log.warning(f"Invalid JSON in auth: {raw[:100]}")
             return None, None
+
         if msg.get("type") != MSG_AUTH:
+            log.warning(f"Wrong message type: {msg.get('type')}")
             return None, None
+
         role = msg.get("role")
         token = msg.get("key", "")
         timestamp = msg.get("ts", 0)
         pair_id = msg.get("pair", "default")
+
         if role not in ("client", "server"):
+            log.warning(f"Invalid role: {role}")
             return None, None
-        if not verify_auth(self.secret, token, timestamp):
+
+        # Detailed auth debugging
+        server_time = time.time()
+        time_diff = abs(server_time - timestamp)
+        expected_token = make_auth_token(self.secret, timestamp)
+        log.info(f"Auth check: role={role} pair={pair_id} ts={timestamp} server_ts={int(server_time)} diff={time_diff:.1f}s")
+        log.info(f"Token check: client={token[:16]}... expected={expected_token[:16]}... match={token == expected_token}")
+
+        if time_diff > TIMESTAMP_TOLERANCE:
+            log.warning(f"Auth failed: timestamp diff {time_diff:.1f}s > {TIMESTAMP_TOLERANCE}s")
             return None, None
+
+        if token != expected_token:
+            log.warning(f"Auth failed: token mismatch (SECRET mismatch?)")
+            return None, None
+
         return role, pair_id
 
     async def _join_pair(self, websocket, role: str, pair_id: str) -> Optional[TunnelPair]:
@@ -178,19 +230,49 @@ async def main():
 
     server = RelayServer(secret=args.secret)
     log.info(f"Relay server starting: 0.0.0.0:{args.port}")
+    log.info(f"SECRET configured: {args.secret[:4]}***")
 
-    # websockets 16.x compatible - no process_request (handle health check in handler)
-    async with websockets.serve(
-        server.handle_connection,
-        "0.0.0.0",
-        args.port,
-        ping_interval=HEARTBEAT_INTERVAL,
-        ping_timeout=10,
-        close_timeout=5,
-        max_size=2**20,
-    ):
-        log.info("Server ready, waiting for connections...")
-        await asyncio.Future()
+    # Health check handler for Render (HEAD/GET to /health)
+    async def health_check(connection, request):
+        """Handle Render health checks - respond to HEAD/GET /health with HTTP 200"""
+        # websockets 16.x: process_request(connection, request)
+        # connection is ServerConnection, request is Request object
+        path = request.path if hasattr(request, 'path') else str(request)
+        method = request.method if hasattr(request, 'method') else 'GET'
+
+        if path == '/health':
+            body = b'OK'
+            return (
+                200,
+                [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))],
+                body,
+            )
+        # Let websockets handle normal WebSocket upgrade requests
+        return None
+
+    # Build serve kwargs - compatible with all websockets versions
+    serve_kwargs = {
+        "handler": server.handle_connection,
+        "host": "0.0.0.0",
+        "port": args.port,
+        "max_size": 2**20,
+        "process_request": health_check,
+    }
+
+    # Add ping/close params
+    serve_kwargs['ping_interval'] = HEARTBEAT_INTERVAL
+    serve_kwargs['ping_timeout'] = 10
+    serve_kwargs['close_timeout'] = 5
+
+    log.info(f"serve kwargs: {list(serve_kwargs.keys())}")
+
+    try:
+        async with websockets.serve(**serve_kwargs):
+            log.info("Server ready, waiting for connections...")
+            await asyncio.Future()
+    except Exception as e:
+        log.error(f"Server failed: {e}\n{traceback.format_exc()}")
+        raise
 
 if __name__ == "__main__":
     try:
