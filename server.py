@@ -37,7 +37,7 @@ log = logging.getLogger("relay")
 MSG_AUTH = "auth"
 AUTH_TIMEOUT = 10
 TIMESTAMP_TOLERANCE = 60
-HEARTBEAT_INTERVAL = 30
+HEARTBEAT_INTERVAL = 15
 
 def make_auth_token(secret: str, timestamp: int) -> str:
     return hashlib.sha256(f"{secret}{timestamp}".encode()).hexdigest()
@@ -103,10 +103,10 @@ class RelayServer:
                 await websocket.send(json.dumps({"type": "status", "msg": "waiting"}))
                 counter = 0
                 while not pair.is_complete:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(3)
                     counter += 1
-                    # Send keepalive every 20s (counter increments every 5s)
-                    if counter % 4 == 0:
+                    # Send keepalive every 9s (counter increments every 3s)
+                    if counter % 3 == 0:
                         try:
                             await websocket.send(json.dumps({"type": "status", "msg": "waiting"}))
                             log.info(f"Keepalive sent to {role} (pair={pair_id})")
@@ -204,7 +204,7 @@ class RelayServer:
             """Send periodic pings to keep Render connection alive"""
             try:
                 while True:
-                    await asyncio.sleep(20)
+                    await asyncio.sleep(10)
                     try:
                         await src_ws.ping()
                     except:
@@ -223,14 +223,23 @@ class RelayServer:
                 try:
                     msg = json.loads(raw)
                     if msg.get("type") == "ping":
-                        # Forward as pong to destination
+                        # Reply pong to source AND forward to destination
+                        try:
+                            await src_ws.send(json.dumps({"type": "pong", "ts": msg.get("ts", 0)}))
+                        except:
+                            break
+                        try:
+                            await dst_ws.send(json.dumps({"type": "ping", "ts": msg.get("ts", 0)}))
+                        except:
+                            break
+                        continue
+                    if msg.get("type") == "pong":
+                        # Forward pong to destination
                         try:
                             await dst_ws.send(json.dumps({"type": "pong", "ts": msg.get("ts", 0)}))
                         except:
                             break
                         continue
-                    if msg.get("type") == "pong":
-                        continue  # Skip pong, already handled
                 except (json.JSONDecodeError, TypeError):
                     pass  # Not JSON, forward as-is
 
